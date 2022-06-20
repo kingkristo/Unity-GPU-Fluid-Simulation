@@ -1,0 +1,210 @@
+﻿#pragma kernel advection
+#pragma kernel divergence
+#pragma kernel calculate_divergence_free
+#pragma kernel Boundary
+#pragma kernel Jacobi_Solve_Pressure
+#pragma kernel Jacobi_Solve_Diffusion
+#pragma kernel Ink_Buffer_To_Texture
+#pragma kernel Copy_Temp
+#pragma kernel Clear_Buffer
+#pragma kernel AddInk
+#pragma kernel AddForce_mouse
+
+//global vars
+int   _resolution;
+float _timeStep;
+
+//helper function
+//convert from a 2d coordinate to 1d for buffer access
+int coordinateTo1D(int2 coordinate) {
+    return clamp(coordinate.x, 0, _resolution - 1) + clamp(coordinate.y, 0, _resolution - 1) * _resolution;
+}
+
+//GENERAL NOTE ABOUT THREADS:
+ //16 * 16 total threads = 256 this is a standard grid size
+ //see this article for why to use this number of threads https://gpuopen.com/learn/optimizing-gpu-occupancy-resource-usage-large-thread-groups/
+ //the id used as disptch is also the same as the coordiate on the grid 
+
+float _dissipation_const;
+StructuredBuffer<float4> _velocity_field;   
+StructuredBuffer<float4>   _curr_advect_field;
+RWStructuredBuffer<float4> _new_advect_field; 
+
+[numthreads(16, 16, 1)]
+void advection(uint3 id : SV_DispatchThreadID)
+{
+    //trace point backwards along its velocity to find its previous location
+    float2 previous_coordinate = id.xy - (_timeStep * _velocity_field[coordinateTo1D(id.xy)]);
+    //clamp in case point is traced outside the buffer
+    previous_coordinate = clamp(previous_coordinate, 0, _resolution - 1);
+    //find the velocity that was carried to the current xy by using the value at the previous coordinate
+    //dissipation const ensures that velocity and dye do not stay indefinitly
+    _new_advect_field[coordinateTo1D(id.xy)] = _dissipation_const * _curr_advect_field[coordinateTo1D(previous_coordinate)];
+}
+
+
+StructuredBuffer<float4> _curr_diffusion_buffer;
+StructuredBuffer<float4> _guess_diffusion_buffer; //previous guess               
+RWStructuredBuffer<float4> _final_diffusion_buffer; //current guess
+float _viscosity;
+//the viscosity equation has 5 unknowns, a jacobi solver is used to estimate them, the higher the iterations the more accurate the guess
+[numthreads(16, 16, 1)]
+void Jacobi_Solve_Diffusion(uint3 id : SV_DispatchThreadID)
+{
+    //thread id is the same as the coordinate in the grid
+    //known
+    float4 kernel_center = _curr_diffusion_buffer[coordinateTo1D(id.xy)];
+    //unknowns
+    float4 kernel_left = _guess_diffusion_buffer[coordinateTo1D(id.xy - int2(1, 0))];
+    float4 kernel_right = _guess_diffusion_buffer[coordinateTo1D(id.xy + int2(1, 0))];
+    float4 kernel_bottom = _guess_diffusion_buffer[coordinateTo1D(id.xy - int2(0, 1))];
+    float4 kernel_top = _guess_diffusion_buffer[coordinateTo1D(id.xy + int2(0, 1))];
+    //solve for new center value
+    _final_diffusion_buffer[coordinateTo1D(id.xy)] = ((_viscosity * _timeStep) * (kernel_left + kernel_right + kernel_bottom + kernel_top) + kernel_center) / (1.0 + 4.0 * (_viscosity * _timeStep));
+}
+
+//fragment program based on the one here: https://developer.nvidia.com/sites/all/modules/custom/gpugems/books/GPUGems/gpugems_ch38.html
+StructuredBuffer<float4> _vector_field; //the field we want to find divergence of (ink or velocity)
+RWStructuredBuffer<float4> _divergence_buffer;
+//calculate the divergence of the newly calculated vector field using possion equation
+[numthreads(16, 16, 1)]
+void divergence(uint3 id : SV_DispatchThreadID)
+{
+    float half_scale_reciprocal = 0.5; //1.0/(2.0 * gridSize)
+    float4 kernel_left = _vector_field[coordinateTo1D(id.xy - int2(1, 0))];
+    float4 kernel_right = _vector_field[coordinateTo1D(id.xy + int2(1, 0))];
+    float4 kernel_bottom = _vector_field[coordinateTo1D(id.xy - int2(0, 1))];
+    float4 kernel_top = _vector_field[coordinateTo1D(id.xy + int2(0, 1))];
+
+    _divergence_buffer[coordinateTo1D(id.xy)] = half_scale_reciprocal * ((kernel_right.x - kernel_left.x) + (kernel_top.y - kernel_bottom.y));
+}
+
+StructuredBuffer<float4> _guess_pressure_buffer; //previous guess               
+RWStructuredBuffer<float4> _final_pressure_buffer; //current guess
+//jacobi method to find pressure field, works in teh same manner as for diffusion
+[numthreads(16, 16, 1)]
+void Jacobi_Solve_Pressure(uint3 id : SV_DispatchThreadID)
+{
+    float4 kernel_left = _guess_pressure_buffer[coordinateTo1D(id.xy - int2(1, 0))];
+    float4 kernel_right = _guess_pressure_buffer[coordinateTo1D(id.xy + int2(1, 0))];
+    float4 kernel_bottom = _guess_pressure_buffer[coordinateTo1D(id.xy - int2(0, 1))];
+    float4 kernel_top = _guess_pressure_buffer[coordinateTo1D(id.xy + int2(0, 1))];
+    //get center value from divergence field
+    float4 kernel_center = _divergence_buffer[coordinateTo1D(id.xy)];
+    //new guess
+    _final_pressure_buffer[coordinateTo1D(id.xy)] = (kernel_left + kernel_right + kernel_bottom + kernel_top + (-1.0 * kernel_center)) * 0.25;
+}
+
+StructuredBuffer<float4> _field_with_divergence; //newly calculated velocity field           
+StructuredBuffer<float4> _pressure; 
+RWStructuredBuffer<float4> _final_field; //no divergence                         
+// once we have the pressure field, we find the gradient and subtract this from our velocity field to remove divergence
+// fragment program based on the one here: https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-38-fast-fluid-dynamics-simulation-gpu
+[numthreads(16, 16, 1)]                                                  
+void calculate_divergence_free(uint3 id : SV_DispatchThreadID)
+{
+
+    float half_scale_reciprocal = 0.5; //1.0/(2.0 * gridSize)
+    float kernel_left = _pressure[coordinateTo1D(id.xy - int2(1, 0))].x;
+    float kernel_right = _pressure[coordinateTo1D(id.xy + int2(1, 0))].x;
+    float kernel_bottom = _pressure[coordinateTo1D(id.xy - int2(0, 1))].x;
+    float kernel_top = _pressure[coordinateTo1D(id.xy + int2(0, 1))].x;
+
+    float4 pressure_gradient = half_scale_reciprocal * float4(kernel_right - kernel_left, kernel_top - kernel_bottom, 0.0, 0.0);
+
+    _final_field[coordinateTo1D(id.xy)] = _field_with_divergence[coordinateTo1D(id.xy)] - pressure_gradient;
+}
+
+RWStructuredBuffer<float4> _boundary_field;
+//set field value on edges to = 0 to prevent weird behaviour
+[numthreads(256, 1, 1)] //1d dispatch used here to make edge calculation simpler
+void Boundary(uint3 id : SV_DispatchThreadID)
+{
+    int  pixel_coordiante = id.x - (id.x / _resolution) * _resolution;//map thread to a pixel at the edge
+
+    //left edge
+    if (id.x / _resolution == 0) {
+        _boundary_field[coordinateTo1D(int2(0, pixel_coordiante))] = 0;
+    }
+    //right edge
+    if (id.x / _resolution == 1) {
+        _boundary_field[coordinateTo1D(int2(_resolution - 1, pixel_coordiante))] = 0;
+    }
+    //top edge
+    if (id.x / _resolution == 2) {
+        _boundary_field[coordinateTo1D(int2(pixel_coordiante, _resolution - 1))] = 0;
+    }
+    //bottom edge
+    if (id.x / _resolution == 3) {
+        _boundary_field[coordinateTo1D(int2(pixel_coordiante, 0))] = 0;
+    }
+}
+
+StructuredBuffer<float4> _Ink_Buffer;
+RWTexture2D<float4> _Out_Texture;
+//Convert ink buffer to a texture which can blit to the camera
+[numthreads(16, 16, 1)]
+void Ink_Buffer_To_Texture(uint3 id : SV_DispatchThreadID)
+{
+    float2 coord = (float2)id.xy;
+
+    _Out_Texture[id.xy] = _Ink_Buffer[coordinateTo1D(coord)];
+}
+
+StructuredBuffer<float4> _Temp;
+RWStructuredBuffer<float4> _Final;
+//1d copy used to copy results from temp buffer to a final buffer
+[numthreads(256, 1, 1)]
+void Copy_Temp(uint3 id : SV_DispatchThreadID)
+{
+    _Final[id.x] = _Temp[id.x];
+}
+
+RWStructuredBuffer<float4> _Buffer_To_Clear;
+//this is used to clear the pressure buffer
+[numthreads(256, 1, 1)]
+void Clear_Buffer(uint3 id : SV_DispatchThreadID)
+{
+    _Buffer_To_Clear[id.x] = float4(0.,0.,0.,0.);
+}
+
+RWStructuredBuffer<float4> _ink_buffer;
+float4 _dye_colour;    
+float2 _mouse_latest;
+//dye constantly produced at mouse position
+[numthreads(16, 16, 1)]
+void AddInk(uint3 id : SV_DispatchThreadID)
+{
+    float  distFromMouse = length(_mouse_latest - (float2)id.xy);
+    //fade further from mouse to prevent hard edge
+    float  inkAmount = smoothstep(25, 10, distFromMouse);
+    _ink_buffer[coordinateTo1D(id.xy)] = _ink_buffer[coordinateTo1D(id.xy)] + inkAmount * _dye_colour;
+    //prevent extreme colour values
+    _ink_buffer[coordinateTo1D(id.xy)] = clamp(_ink_buffer[coordinateTo1D(id.xy)], 0, _dye_colour);
+}
+
+RWStructuredBuffer<float4> _force_buffer;
+float2 _mouse_old;
+//add force constantly to any pixels between the current and old mouse pos
+[numthreads(16, 16, 1)]
+void AddForce_mouse(uint3 id : SV_DispatchThreadID) {
+    float2 mouse_travel = _mouse_latest - _mouse_old;
+    float  mouse_distance = length(mouse_travel);
+    float2 direction = mouse_travel / mouse_distance;
+    float2 uv = (float2) id.xy - _mouse_old;
+    float size = 1.0;
+    float smoothness = 2.0;
+
+    //2D drawing utility taken from https://github.com/IRCSS/Compute-Shaders-Fluid-Dynamic-/blob/main/Assets/Shaders/Resources/FluidDynamic/2DDrawingUtility.cginc
+    float  v2 = dot(direction, direction);
+    float  vUv = dot(direction, uv);
+    float2 p = direction * vUv / v2;
+    float  d = distance(p, uv);
+    float  m = 1. - step(0., vUv / v2);
+    m += smoothstep(mouse_distance, mouse_distance + smoothness / 2., vUv / v2);
+    float pixelOnPath = 1. - clamp(smoothstep(size, size + smoothness, d) + m, 0., 1.);
+    ///////////////////////////////////////////////////////////////////////////////////
+    
+    //force multiplied by 3 via trial and error to get an appealing look
+    _force_buffer[coordinateTo1D(id.xy)] += float4(mouse_travel.xy * pixelOnPath * 3, 0., 0.);
+}
